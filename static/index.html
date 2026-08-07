@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PaperSage - Paper Summarization and Guided Exploration</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/markdown-it/12.3.2/markdown-it.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Roboto', sans-serif;
+            background-color: #121212;
+            color: #e0e0e0;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        #chat-container {
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            width: 100%;
+            height: 100vh;
+            background-color: #1e1e1e;
+        }
+
+        header {
+            background: linear-gradient(45deg, #6200ea, #3700b3);
+            text-align: center;
+            padding: 20px;
+            color: #ffffff;
+            font-size: 1.75rem;
+            font-weight: bold;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+        }
+
+        #messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            background-color: #1e1e1e;
+        }
+
+        .agent-message {
+            padding: 15px;
+            border-radius: 12px;
+            word-wrap: break-word;
+            max-width: 80%;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+
+        .agent-message.system {
+            background-color: #2e2e2e;
+            color: #e0e0e0;
+        }
+
+        .agent-message.result {
+            background-color: #3a3f5a;
+            color: #ffffff;
+            align-self: flex-start;
+            word-break: break-word;
+            white-space: pre-wrap;
+        }
+
+        .agent-message.result ol,
+        .agent-message.result ul {
+            padding-left: 25px;
+            margin-left: 5px;
+        }
+        .agent-message.result li {
+            margin-bottom: 4px;
+        }
+
+        .agent-message.user {
+            background: linear-gradient(45deg, #4caf50, #388e3c);
+            color: #ffffff;
+            align-self: flex-end;
+        }
+
+        /* 呼吸加载动画 —— 让文字忽明忽暗 */
+        .status-loading {
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 0.6; }
+            50% { opacity: 1; }
+            100% { opacity: 0.6; }
+        }
+
+        #input-container {
+            display: flex;
+            align-items: center;
+            padding: 10px 20px;
+            background-color: #1e1e1e;
+            border-top: 1px solid #555;
+        }
+
+        #message-input {
+            flex: 1;
+            padding: 15px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            background-color: #2e2e2e;
+            color: #e0e0e0;
+        }
+
+        #message-input:focus {
+            outline: 2px solid #6200ea;
+        }
+
+        #send-button {
+            margin-left: 10px;
+            padding: 15px;
+            background: linear-gradient(45deg, #6200ea, #3700b3);
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+        }
+
+        #send-button:hover {
+            background-color: #3700b3;
+        }
+
+        #send-button:disabled {
+            background-color: #424242;
+            cursor: not-allowed;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div id="chat-container">
+        <header>PAPERSAGE</header>
+        <div id="messages" role="log" aria-live="polite"></div>
+        <div id="input-container">
+            <input type="text" id="message-input" placeholder="Enter your query..." autocomplete="off" aria-label="Message input field">
+            <button id="send-button" disabled aria-label="Send message">Send</button>
+        </div>
+    </div>
+
+    <script>
+        const md = window.markdownit();
+        const wsUrl = window.location.origin.replace(/^http/, 'ws') + '/ws';
+        const ws = new WebSocket(wsUrl);
+        const messages = document.getElementById('messages');
+        const input = document.getElementById('message-input');
+        const sendButton = document.getElementById('send-button');
+
+        let loadingDiv = null;
+        let currentChatDiv = null;
+        let currentChatResponseDiv = null;
+
+        ws.onopen = () => console.log('Connected to WebSocket');
+
+        ws.onmessage = (event) => {
+            if (loadingDiv) {
+                loadingDiv.remove();
+                loadingDiv = null;
+            }
+
+            const response = JSON.parse(event.data);
+            if (response.type === 'error') {
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'agent-message system';
+                errorDiv.style.color = 'red';
+                errorDiv.textContent = `❌ Error: ${response.message}`;
+                messages.appendChild(errorDiv);
+                currentChatDiv = null;
+                currentChatResponseDiv = null;
+                return;
+            }
+
+            if (response.type === 'update') {
+                const agent = response.agent;
+                let content = response.content || '';
+
+                if (agent === 'user') {
+                    return;
+                }
+
+                if (agent === 'FormatterAgent') {
+                    const resultDiv = document.createElement('div');
+                    resultDiv.className = 'agent-message result';
+                    content = content.replace(/\s*\*\*TERMINATE\*\*\s*$/, '').replace(/\s*TERMINATE\s*$/, '');
+                    resultDiv.innerHTML = md.render(content);
+                    messages.appendChild(resultDiv);
+                    currentChatDiv = null;
+                    currentChatResponseDiv = null;
+                } else if (agent === 'ChatAgent') {
+                    if (!currentChatDiv) {
+                        currentChatDiv = document.createElement('div');
+                        currentChatDiv.className = 'agent-message system';
+                        currentChatDiv.textContent = '🤖 正在思考...';
+                        messages.appendChild(currentChatDiv);
+
+                        currentChatResponseDiv = document.createElement('div');
+                        currentChatResponseDiv.className = 'agent-message system';
+                        currentChatResponseDiv.textContent = '';
+                        messages.appendChild(currentChatResponseDiv);
+                    }
+                    if (content === '🤖 正在思考...\n\n') {
+                        return;
+                    } else {
+                        currentChatResponseDiv.textContent += content;
+                    }
+                    messages.scrollTop = messages.scrollHeight;
+                    return;
+                } else if (agent === 'SearchAgent') {
+                    if (content.includes('Successfully retrieved')) {
+                        const match = content.match(/retrieved (\d+) articles/);
+                        if (match) {
+                            const msgDiv = document.createElement('div');
+                            msgDiv.className = 'agent-message system';
+                            msgDiv.textContent = `🔍 已检索到 ${match[1]} 篇文献`;
+                            messages.appendChild(msgDiv);
+                        }
+                    }
+                    currentChatDiv = null;
+                    currentChatResponseDiv = null;
+                } else if (agent === 'QueryPlanner') {
+                    const msgDiv = document.createElement('div');
+                    msgDiv.className = 'agent-message system status-loading';  // 添加加载动画
+                    msgDiv.textContent = '📋 正在优化搜索策略...';
+                    messages.appendChild(msgDiv);
+                    currentChatDiv = null;
+                    currentChatResponseDiv = null;
+                } else if (agent === 'SynthesisAgent') {
+                    const msgDiv = document.createElement('div');
+                    msgDiv.className = 'agent-message system status-loading';  // 添加加载动画
+                    msgDiv.textContent = '✍️ 正在撰写综述...';
+                    messages.appendChild(msgDiv);
+                    currentChatDiv = null;
+                    currentChatResponseDiv = null;
+                } else {
+                    const msgDiv = document.createElement('div');
+                    msgDiv.className = 'agent-message system';
+                    const isMarkdown = content.trim().startsWith('#') || 
+                                       content.includes('##') || 
+                                       content.includes('**') ||
+                                       content.includes('- ') ||
+                                       content.includes('* ') ||
+                                       content.includes('###');
+                    if (isMarkdown) {
+                        msgDiv.className = 'agent-message result';
+                        content = content.replace(/\s*\*\*TERMINATE\*\*\s*$/, '').replace(/\s*TERMINATE\s*$/, '');
+                        msgDiv.innerHTML = md.render(content);
+                    } else {
+                        if (content.length > 100) {
+                            content = content.substring(0, 100) + '...';
+                        }
+                        msgDiv.textContent = content;
+                    }
+                    messages.appendChild(msgDiv);
+                    currentChatDiv = null;
+                    currentChatResponseDiv = null;
+                }
+            } else if (response.type === 'end') {
+                if (currentChatResponseDiv) {
+                    const rawText = currentChatResponseDiv.textContent;
+                    currentChatResponseDiv.innerHTML = md.render(rawText);
+                    currentChatResponseDiv.className = 'agent-message result';
+                }
+                currentChatDiv = null;
+                currentChatResponseDiv = null;
+            }
+
+            messages.scrollTop = messages.scrollHeight;
+        };
+
+        ws.onerror = (error) => {
+            console.error('WebSocket error:', error);
+            if (loadingDiv) {
+                loadingDiv.remove();
+                loadingDiv = null;
+            }
+            const errorDiv = document.createElement('div');
+            errorDiv.className = 'agent-message system';
+            errorDiv.style.color = 'red';
+            errorDiv.textContent = '❌ Connection lost. Please try again later.';
+            messages.appendChild(errorDiv);
+        };
+
+        ws.onclose = () => {
+            if (loadingDiv) {
+                loadingDiv.remove();
+                loadingDiv = null;
+            }
+            const closeDiv = document.createElement('div');
+            closeDiv.className = 'agent-message system';
+            closeDiv.style.color = 'orange';
+            closeDiv.textContent = '⏳ Connection closed. Reconnecting...';
+            messages.appendChild(closeDiv);
+            setTimeout(() => location.reload(), 5000);
+        };
+
+        function sendMessage() {
+            const message = input.value.trim();
+            if (message) {
+                const userDiv = document.createElement('div');
+                userDiv.className = 'agent-message user';
+                userDiv.textContent = `You: ${message}`;
+                messages.appendChild(userDiv);
+
+                loadingDiv = document.createElement('div');
+                loadingDiv.className = 'agent-message system';
+                loadingDiv.textContent = '⏳ 正在处理，请稍候...';
+                messages.appendChild(loadingDiv);
+                messages.scrollTop = messages.scrollHeight;
+
+                ws.send(JSON.stringify({ type: 'user_message', content: message }));
+                input.value = '';
+                sendButton.disabled = true;
+            }
+        }
+
+        input.addEventListener('input', () => {
+            sendButton.disabled = input.value.trim() === '';
+        });
+
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        sendButton.addEventListener('click', sendMessage);
+        sendButton.disabled = true;
+    </script>
+</body>
+</html>

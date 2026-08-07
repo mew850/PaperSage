@@ -1,0 +1,184 @@
+import json
+import time
+import asyncio
+import os
+from typing import Optional
+from fastapi import FastAPI, WebSocket, Request, Header, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
+from .chat_handler import ChatHandler
+from .agents import AcademicSearchTeam, SimpleChatAgent
+from fastapi.responses import FileResponse
+
+load_dotenv()
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# 初始化 ChatHandler（用于 WebSocket）
+chat_handler = ChatHandler()
+
+# ---------- 清小搭兼容端点 ----------
+VALID_API_KEY = os.getenv("LITERAS_API_KEY", "sk-your-secret-key")
+
+def check_auth(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing credential")
+    token = authorization[len("Bearer "):]
+    if token != VALID_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid credential")
+
+# 全局 Agent 实例（用于 /v1/chat/completions）
+search_agent = AcademicSearchTeam()
+chat_agent = SimpleChatAgent()
+
+@app.get("/v1/models")
+async def list_models(authorization: Optional[str] = Header(None)):
+    check_auth(authorization)
+    return {"object": "list", "data": [{"id": "literas-default", "object": "model"}]}
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
+    check_auth(authorization)
+    body = await request.json()
+    stream = bool(body.get("stream", False))
+    messages = body.get("messages", [])
+    max_tokens = body.get("max_tokens")
+
+    user_msg = ""
+    for m in reversed(messages):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            user_msg = m["content"].strip()
+            break
+    if not user_msg:
+        raise HTTPException(status_code=400, detail="No user message")
+
+    # ----- 快速路径：探测请求（max_tokens <= 10）-----
+    if max_tokens is not None and max_tokens <= 10:
+        reply = "OK"
+        cid = f"chatcmpl-{int(time.time()*1000)}"
+        created = int(time.time())
+        usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        if stream:
+            async def fast_sse():
+                yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+                yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'choices': [{'index': 0, 'delta': {'content': reply}, 'finish_reason': None}]})}\n\n"
+                yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': usage})}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(fast_sse(), media_type="text/event-stream")
+        else:
+            return JSONResponse({
+                "id": cid,
+                "object": "chat.completion",
+                "created": created,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}],
+                "usage": usage
+            })
+
+    # ----- 意图识别 -----
+    search_keywords = ["综述", "文献", "研究进展", "机制", "调控", "review", "literature", "mechanism", "sleep", "drosophila"]
+    is_search = any(kw in user_msg.lower() for kw in search_keywords)
+
+    if is_search:
+        # 文献检索 + 综述（使用 search_agent）
+        # 先收集所有更新，提取最终内容
+        updates = []
+        async for update in search_agent.process_query(user_msg):
+            updates.append(update)
+        # 提取最终内容（优先 FormatterAgent，其次 SynthesisAgent）
+        final_content = ""
+        for up in updates:
+            if up.get("agent") == "FormatterAgent":
+                final_content = up.get("content", "")
+                break
+        if not final_content:
+            for up in reversed(updates):
+                if up.get("agent") == "SynthesisAgent":
+                    final_content = up.get("content", "")
+                    break
+        if not final_content:
+            final_content = "No content generated."
+
+        # 去除可能的 TERMINATE 标记
+        final_content = final_content.replace("**TERMINATE**", "").strip()
+
+        cid = f"chatcmpl-{int(time.time()*1000)}"
+        created = int(time.time())
+        usage = {"prompt_tokens": len(user_msg)//4, "completion_tokens": len(final_content)//4, "total_tokens": (len(user_msg)+len(final_content))//4}
+
+        async def generate_search():
+            yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+            chunk_size = 20
+            for i in range(0, len(final_content), chunk_size):
+                chunk = final_content[i:i+chunk_size]
+                yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
+                await asyncio.sleep(0.02)
+            yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': usage})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        if stream:
+            return StreamingResponse(generate_search(), media_type="text/event-stream")
+        else:
+            return JSONResponse({
+                "id": cid,
+                "object": "chat.completion",
+                "created": created,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": final_content}, "finish_reason": "stop"}],
+                "usage": usage
+            })
+
+    else:
+        # 普通对话（使用 chat_agent）
+        cid = f"chatcmpl-{int(time.time()*1000)}"
+        created = int(time.time())
+
+        async def generate_chat():
+            yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+            full_content = ""
+            async for chunk in chat_agent.chat_stream([{"role": "user", "content": user_msg}]):
+                full_content += chunk
+                yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
+            usage = {"prompt_tokens": len(user_msg)//4, "completion_tokens": len(full_content)//4, "total_tokens": (len(user_msg)+len(full_content))//4}
+            yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': usage})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        if stream:
+            return StreamingResponse(generate_chat(), media_type="text/event-stream")
+        else:
+            # 非流式：收集全部内容
+            full_content = ""
+            async for chunk in chat_agent.chat_stream([{"role": "user", "content": user_msg}]):
+                full_content += chunk
+            usage = {"prompt_tokens": len(user_msg)//4, "completion_tokens": len(full_content)//4, "total_tokens": (len(user_msg)+len(full_content))//4}
+            return JSONResponse({
+                "id": cid,
+                "object": "chat.completion",
+                "created": created,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content}, "finish_reason": "stop"}],
+                "usage": usage
+            })
+
+# ---------- 本地 WebSocket ----------
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await chat_handler.handle_websocket(websocket)
+
+@app.get("/")
+async def read_root():
+    return {"status": "Literature Review Agent is running"}
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return FileResponse("static/guide.svg")
