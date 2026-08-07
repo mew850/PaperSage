@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PaperSage - Paper Summarization and Guided Exploration</title>
+    <title>PaperSage_v2.0 - Paper Summarization and Guided Exploration</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/markdown-it/12.3.2/markdown-it.min.js"></script>
     <style>
         * {
@@ -47,6 +47,28 @@
             flex-direction: column;
             gap: 10px;
             background-color: #1e1e1e;
+        }
+        .agent-message.result table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 10px 0;
+            font-size: 0.9em;
+        }
+        .agent-message.result th, .agent-message.result td {
+            border: 1px solid #555;
+            padding: 8px;
+            text-align: left;
+            word-break: break-word;
+        }
+        .agent-message.result th {
+            background-color: #2e2e2e;
+            font-weight: bold;
+        }
+        .agent-message.result tr:nth-child(even) {
+            background-color: #2a2a2a;
+        }
+        .agent-message.result a {
+            color: #bb86fc;
         }
 
         .agent-message {
@@ -145,7 +167,7 @@
 </head>
 <body>
     <div id="chat-container">
-        <header>PAPERSAGE</header>
+        <header>PAPERSAGE_v2.0</header>
         <div id="messages" role="log" aria-live="polite"></div>
         <div id="input-container">
             <input type="text" id="message-input" placeholder="Enter your query..." autocomplete="off" aria-label="Message input field">
@@ -243,6 +265,13 @@
                     const msgDiv = document.createElement('div');
                     msgDiv.className = 'agent-message system status-loading';  // 添加加载动画
                     msgDiv.textContent = '✍️ 正在撰写综述...';
+                    messages.appendChild(msgDiv);
+                    currentChatDiv = null;
+                    currentChatResponseDiv = null;
+                } else if (agent === 'Thinking') {
+                    const msgDiv = document.createElement('div');
+                    msgDiv.className = 'agent-message system status-loading';
+                    msgDiv.textContent = '🤔 正在思考...';
                     messages.appendChild(msgDiv);
                     currentChatDiv = null;
                     currentChatResponseDiv = null;

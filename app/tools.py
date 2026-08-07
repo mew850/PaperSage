@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 import asyncio
 import os
 import urllib.parse
+from exa_py import Exa
 
 PUBMED_MAX_RESULTS = 8
 ABSTRACT_MAX_CHARS = 200
@@ -153,3 +154,52 @@ async def pubmed_search(query: str, max_results: int = None) -> List[Dict]:
 
         print(f"Successfully retrieved {len(results)} articles")
         return results
+
+async def exa_search(query: str, max_results: int = None) -> List[Dict]:
+    """
+    使用 Exa 搜索引擎检索学术文献（覆盖全学科）。
+    返回格式与 pubmed_search 一致，以便无缝集成。
+    """
+    if max_results is None:
+        max_results = 8  # 与 PubMed 默认一致
+    api_key = os.getenv("EXA_API_KEY", "").strip()
+    if not api_key:
+        print("⚠️  EXA_API_KEY 未设置，跳过 Exa 搜索")
+        return []
+    try:
+        # 同步调用 Exa（Exa 库可能为同步，但可以在异步函数中用 run_in_executor 或直接调用）
+        # 假设 Exa 库支持异步，如果不支持，可以用 loop.run_in_executor
+        exa = Exa(api_key)
+        # 搜索学术内容，可指定 type="neural" 以获得更好的语义理解
+        result = exa.search(
+            query,
+            num_results=max_results,
+            type="auto",          # (instant, fast, auto, deep)
+            contents={
+                "highlights": True, # 返回高亮片段
+                "summary": False,   # 也可启用摘要，但我们用高亮作为摘要
+            }
+        )
+        papers = []
+        for item in result.results:
+            # 提取高亮片段作为“摘要”
+            highlights = item.highlights if hasattr(item, 'highlights') else []
+            abstract = highlights[0] if highlights else "No abstract available"
+            # 构建类似 PubMed 的结构
+            paper = {
+                "title": item.title or "No title",
+                "abstract": abstract[:500],  # 截断以保持一致性
+                "journal": "Exa Search",      # Exa 不提供期刊，可置为固定值或从来源推断
+                "date": "Unknown",
+                "doi": item.url or "",        # 用 URL 作为标识
+                "first_author": "Unknown",    # Exa 不直接提供作者
+                "pmid": "",                  # 无 PMID
+                "url": item.url,              # 额外保留链接
+                "source": "exa"               # 标记来源
+            }
+            papers.append(paper)
+        print(f"Exa 检索到 {len(papers)} 条结果")
+        return papers
+    except Exception as e:
+        print(f"Exa 搜索出错: {e}")
+        return []
