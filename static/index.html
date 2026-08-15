@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PaperSage_v2.0 - Paper Summarization and Guided Exploration</title>
+    <title>PaperSage_v2.1 - Paper Summarization and Guided Exploration</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/markdown-it/12.3.2/markdown-it.min.js"></script>
     <style>
         * {
@@ -48,13 +48,16 @@
             gap: 10px;
             background-color: #1e1e1e;
         }
+
+        /* ---------- 卡片表格样式 ---------- */
         .agent-message.result table {
             border-collapse: collapse;
             width: 100%;
             margin: 10px 0;
             font-size: 0.9em;
         }
-        .agent-message.result th, .agent-message.result td {
+        .agent-message.result th,
+        .agent-message.result td {
             border: 1px solid #555;
             padding: 8px;
             text-align: left;
@@ -71,25 +74,39 @@
             color: #bb86fc;
         }
 
+        /* ---------- 基础消息样式 ---------- */
         .agent-message {
             padding: 15px;
             border-radius: 12px;
             word-wrap: break-word;
-            max-width: 80%;
+            /* 移除基类宽度限制，由子类决定 */
+            max-width: 100%;
             animation: fadeIn 0.3s ease-in-out;
         }
 
         .agent-message.system {
             background-color: #2e2e2e;
             color: #e0e0e0;
+            max-width: 80%; /* system 消息保持窄一些 */
         }
 
+        /* ---------- 核心修复：结果卡片 ---------- */
         .agent-message.result {
             background-color: #3a3f5a;
             color: #ffffff;
             align-self: flex-start;
-            word-break: break-word;
-            white-space: pre-wrap;
+            max-width: 95%;              /* 占父容器 95% */
+            word-break: break-all;       /* 强制断词（对长URL有效） */
+            overflow-wrap: break-word;
+            white-space: normal;
+            display: block;
+            padding: 15px;
+            /* 保证所有内部元素不溢出 */
+        }
+        .agent-message.result * {
+            max-width: 100%;
+            word-break: break-word;      /* 内部元素继承断词 */
+            overflow-wrap: break-word;
         }
 
         .agent-message.result ol,
@@ -105,9 +122,10 @@
             background: linear-gradient(45deg, #4caf50, #388e3c);
             color: #ffffff;
             align-self: flex-end;
+            max-width: 80%;
         }
 
-        /* 呼吸加载动画 —— 让文字忽明忽暗 */
+        /* 呼吸加载动画 */
         .status-loading {
             animation: pulse 1.5s ease-in-out infinite;
         }
@@ -115,6 +133,47 @@
             0% { opacity: 0.6; }
             50% { opacity: 1; }
             100% { opacity: 0.6; }
+        }
+
+        /* 工具栏样式 */
+        #toolbar {
+            display: flex;
+            padding: 10px 20px;
+            gap: 10px;
+            background: #2a2a2a;
+            border-bottom: 1px solid #555;
+            align-items: center;
+        }
+        #toolbar button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        #toolbar button:hover {
+            opacity: 0.8;
+        }
+        #upload-btn {
+            background: #6200ea;
+            color: #fff;
+        }
+        #parse-url-btn {
+            background: #03dac6;
+            color: #000;
+        }
+        #url-input {
+            flex: 1;
+            padding: 8px 12px;
+            background: #1e1e1e;
+            color: #e0e0e0;
+            border: 1px solid #555;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        #url-input:focus {
+            outline: 2px solid #6200ea;
         }
 
         #input-container {
@@ -167,7 +226,14 @@
 </head>
 <body>
     <div id="chat-container">
-        <header>PAPERSAGE_v2.0</header>
+        <header>PAPERSAGE_v2.1</header>
+        <!-- 工具栏 -->
+        <div id="toolbar">
+            <input type="file" id="file-input" accept=".pdf,.txt" style="display: none;">
+            <button id="upload-btn">📤 上传文件</button>
+            <input type="text" id="url-input" placeholder="输入网页 URL..." autocomplete="off">
+            <button id="parse-url-btn">🌐 解析 URL</button>
+        </div>
         <div id="messages" role="log" aria-live="polite"></div>
         <div id="input-container">
             <input type="text" id="message-input" placeholder="Enter your query..." autocomplete="off" aria-label="Message input field">
@@ -176,17 +242,27 @@
     </div>
 
     <script>
-        const md = window.markdownit();
+        // markdown-it 配置（增强兼容性）
+        const md = window.markdownit({
+            breaks: true,      // 换行转 <br>
+            linkify: true,     // 自动链接 URL
+            html: true,        // 允许 HTML（安全）
+            typographer: true  // 智能引号等
+        });
+
         const wsUrl = window.location.origin.replace(/^http/, 'ws') + '/ws';
         const ws = new WebSocket(wsUrl);
-        const messages = document.getElementById('messages');
+        const messagesContainer = document.getElementById('messages');
         const input = document.getElementById('message-input');
         const sendButton = document.getElementById('send-button');
+        const fileInput = document.getElementById('file-input');
+        const urlInput = document.getElementById('url-input');
 
         let loadingDiv = null;
         let currentChatDiv = null;
         let currentChatResponseDiv = null;
 
+        // ---------- WebSocket 事件 ----------
         ws.onopen = () => console.log('Connected to WebSocket');
 
         ws.onmessage = (event) => {
@@ -201,7 +277,7 @@
                 errorDiv.className = 'agent-message system';
                 errorDiv.style.color = 'red';
                 errorDiv.textContent = `❌ Error: ${response.message}`;
-                messages.appendChild(errorDiv);
+                messagesContainer.appendChild(errorDiv);
                 currentChatDiv = null;
                 currentChatResponseDiv = null;
                 return;
@@ -211,16 +287,15 @@
                 const agent = response.agent;
                 let content = response.content || '';
 
-                if (agent === 'user') {
-                    return;
-                }
+                if (agent === 'user') return;
 
+                // 显示逻辑
                 if (agent === 'FormatterAgent') {
                     const resultDiv = document.createElement('div');
                     resultDiv.className = 'agent-message result';
                     content = content.replace(/\s*\*\*TERMINATE\*\*\s*$/, '').replace(/\s*TERMINATE\s*$/, '');
                     resultDiv.innerHTML = md.render(content);
-                    messages.appendChild(resultDiv);
+                    messagesContainer.appendChild(resultDiv);
                     currentChatDiv = null;
                     currentChatResponseDiv = null;
                 } else if (agent === 'ChatAgent') {
@@ -228,19 +303,15 @@
                         currentChatDiv = document.createElement('div');
                         currentChatDiv.className = 'agent-message system';
                         currentChatDiv.textContent = '🤖 正在思考...';
-                        messages.appendChild(currentChatDiv);
-
+                        messagesContainer.appendChild(currentChatDiv);
                         currentChatResponseDiv = document.createElement('div');
                         currentChatResponseDiv.className = 'agent-message system';
                         currentChatResponseDiv.textContent = '';
-                        messages.appendChild(currentChatResponseDiv);
+                        messagesContainer.appendChild(currentChatResponseDiv);
                     }
-                    if (content === '🤖 正在思考...\n\n') {
-                        return;
-                    } else {
-                        currentChatResponseDiv.textContent += content;
-                    }
-                    messages.scrollTop = messages.scrollHeight;
+                    if (content === '🤖 正在思考...\n\n') return;
+                    currentChatResponseDiv.textContent += content;
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
                     return;
                 } else if (agent === 'SearchAgent') {
                     if (content.includes('Successfully retrieved')) {
@@ -249,35 +320,47 @@
                             const msgDiv = document.createElement('div');
                             msgDiv.className = 'agent-message system';
                             msgDiv.textContent = `🔍 已检索到 ${match[1]} 篇文献`;
-                            messages.appendChild(msgDiv);
+                            messagesContainer.appendChild(msgDiv);
                         }
                     }
                     currentChatDiv = null;
                     currentChatResponseDiv = null;
                 } else if (agent === 'QueryPlanner') {
                     const msgDiv = document.createElement('div');
-                    msgDiv.className = 'agent-message system status-loading';  // 添加加载动画
+                    msgDiv.className = 'agent-message system status-loading';
                     msgDiv.textContent = '📋 正在优化搜索策略...';
-                    messages.appendChild(msgDiv);
+                    messagesContainer.appendChild(msgDiv);
                     currentChatDiv = null;
                     currentChatResponseDiv = null;
                 } else if (agent === 'SynthesisAgent') {
                     const msgDiv = document.createElement('div');
-                    msgDiv.className = 'agent-message system status-loading';  // 添加加载动画
+                    msgDiv.className = 'agent-message system status-loading';
                     msgDiv.textContent = '✍️ 正在撰写综述...';
-                    messages.appendChild(msgDiv);
+                    messagesContainer.appendChild(msgDiv);
                     currentChatDiv = null;
                     currentChatResponseDiv = null;
-                } else if (agent === 'Thinking') {
-                    const msgDiv = document.createElement('div');
-                    msgDiv.className = 'agent-message system status-loading';
-                    msgDiv.textContent = '🤔 正在思考...';
-                    messages.appendChild(msgDiv);
+                } else if (agent === 'Thinking' || agent === 'System' || agent === 'FastSummary') {
+                    if (agent === 'FastSummary' || agent === 'System') {
+                        const resultDiv = document.createElement('div');
+                        resultDiv.className = agent === 'System' ? 'agent-message system' : 'agent-message result';
+                        if (agent === 'System') {
+                            resultDiv.textContent = content;
+                        } else {
+                            // FastSummary 渲染 Markdown
+                            resultDiv.innerHTML = md.render(content);
+                        }
+                        messagesContainer.appendChild(resultDiv);
+                    } else {
+                        const msgDiv = document.createElement('div');
+                        msgDiv.className = 'agent-message system status-loading';
+                        msgDiv.textContent = content || '🤔 正在思考...';
+                        messagesContainer.appendChild(msgDiv);
+                    }
                     currentChatDiv = null;
                     currentChatResponseDiv = null;
                 } else {
+                    // 其他 agent（fallback）
                     const msgDiv = document.createElement('div');
-                    msgDiv.className = 'agent-message system';
                     const isMarkdown = content.trim().startsWith('#') || 
                                        content.includes('##') || 
                                        content.includes('**') ||
@@ -289,16 +372,18 @@
                         content = content.replace(/\s*\*\*TERMINATE\*\*\s*$/, '').replace(/\s*TERMINATE\s*$/, '');
                         msgDiv.innerHTML = md.render(content);
                     } else {
+                        msgDiv.className = 'agent-message system';
                         if (content.length > 100) {
                             content = content.substring(0, 100) + '...';
                         }
                         msgDiv.textContent = content;
                     }
-                    messages.appendChild(msgDiv);
+                    messagesContainer.appendChild(msgDiv);
                     currentChatDiv = null;
                     currentChatResponseDiv = null;
                 }
             } else if (response.type === 'end') {
+                // ChatAgent 最终渲染
                 if (currentChatResponseDiv) {
                     const rawText = currentChatResponseDiv.textContent;
                     currentChatResponseDiv.innerHTML = md.render(rawText);
@@ -308,7 +393,7 @@
                 currentChatResponseDiv = null;
             }
 
-            messages.scrollTop = messages.scrollHeight;
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
         };
 
         ws.onerror = (error) => {
@@ -321,7 +406,7 @@
             errorDiv.className = 'agent-message system';
             errorDiv.style.color = 'red';
             errorDiv.textContent = '❌ Connection lost. Please try again later.';
-            messages.appendChild(errorDiv);
+            messagesContainer.appendChild(errorDiv);
         };
 
         ws.onclose = () => {
@@ -333,7 +418,7 @@
             closeDiv.className = 'agent-message system';
             closeDiv.style.color = 'orange';
             closeDiv.textContent = '⏳ Connection closed. Reconnecting...';
-            messages.appendChild(closeDiv);
+            messagesContainer.appendChild(closeDiv);
             setTimeout(() => location.reload(), 5000);
         };
 
@@ -343,13 +428,13 @@
                 const userDiv = document.createElement('div');
                 userDiv.className = 'agent-message user';
                 userDiv.textContent = `You: ${message}`;
-                messages.appendChild(userDiv);
+                messagesContainer.appendChild(userDiv);
 
                 loadingDiv = document.createElement('div');
                 loadingDiv.className = 'agent-message system';
                 loadingDiv.textContent = '⏳ 正在处理，请稍候...';
-                messages.appendChild(loadingDiv);
-                messages.scrollTop = messages.scrollHeight;
+                messagesContainer.appendChild(loadingDiv);
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
                 ws.send(JSON.stringify({ type: 'user_message', content: message }));
                 input.value = '';
@@ -357,14 +442,52 @@
             }
         }
 
+        // ----- 文件上传和 URL 解析事件 -----
+        document.getElementById('upload-btn').addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        fileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const formData = new FormData();
+            formData.append('file', file);
+            try {
+                const response = await fetch('/upload', { method: 'POST', body: formData });
+                if (!response.ok) {
+                    const err = await response.text();
+                    alert(`上传失败: ${err}`);
+                    return;
+                }
+                const data = await response.json();
+                const msg = `解析文件: ${data.file_id}`;
+                input.value = msg;
+                sendMessage();
+            } catch (err) {
+                alert(`上传异常: ${err.message}`);
+            }
+            fileInput.value = '';
+        });
+
+        document.getElementById('parse-url-btn').addEventListener('click', () => {
+            const url = urlInput.value.trim();
+            if (!url) {
+                alert('请输入有效的 URL');
+                return;
+            }
+            const msg = `解析URL: ${url}`;
+            input.value = msg;
+            sendMessage();
+            urlInput.value = '';
+        });
+
+        // 输入框事件
         input.addEventListener('input', () => {
             sendButton.disabled = input.value.trim() === '';
         });
-
         input.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') sendMessage();
         });
-
         sendButton.addEventListener('click', sendMessage);
         sendButton.disabled = true;
     </script>
