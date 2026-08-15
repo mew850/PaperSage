@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from typing import Optional, AsyncGenerator
+from typing import Optional, AsyncGenerator, List, Dict, Any
 from openai import AsyncOpenAI
 import asyncio
 from autogen_agentchat.agents import AssistantAgent
@@ -13,6 +13,8 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 from exa_py import Exa
 from .tools import pubmed_search, configure_pubmed, exa_search
 import re 
+import requests
+
 DEEPSEEK_BASE_URL = "https://llmapi.paratera.com/"
 DEFAULT_MODEL = "DeepSeek-V4-Flash"
 
@@ -222,116 +224,167 @@ class SimpleChatAgent:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
 
+
+# ---------- 语义检索 Agent（深度模式，支持交互式追问） ----------
 class SemanticSearchAgent:
-    """专门执行语义检索，返回结构化表格，摘要由 LLM 生成"""
     def __init__(self, api_key: str = None, base_url: str = None, model: str = None):
-        self.exa_api_key = api_key or os.getenv("EXA_API_KEY")
+        self.exa_api_key = os.getenv("EXA_API_KEY")
         if not self.exa_api_key:
-            print("⚠️  EXA_API_KEY 未设置，语义检索不可用")
-        # LLM 配置（用于生成摘要）
+            print("⚠️  EXA_API_KEY 未设置，Exa搜索不可用")
+        self.exa = Exa(self.exa_api_key) if self.exa_api_key else None
+
+        # 对话历史存储（用于交互式问答）
+        self.conversation_history = []
+        # 存储最近一次检索的论文列表
+        self._last_papers = []
+
+        # LLM 配置（用于追问回答）
         self.llm_api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
         self.llm_base_url = base_url or os.getenv("LITERAS_BASE_URL") or "https://api.deepseek.com/v1"
         self.llm_model = model or os.getenv("LITERAS_MODEL") or "deepseek-chat"
         self.client = AsyncOpenAI(api_key=self.llm_api_key, base_url=self.llm_base_url) if self.llm_api_key else None
 
-    async def _generate_summary(self, title: str, text: str, max_len: int = 300) -> str:
-        """调用 LLM 生成简洁摘要"""
-        if not self.client:
-            return text[:200] + "…" if text else "No summary"
-        try:
-            prompt = f"请用中文为以下文献标题和内容生成一个简洁的摘要（不超过{max_len}字）：\n标题：{title}\n内容片段：{text[:1000]}\n摘要："
-            response = await self.client.chat.completions.create(
-                model=self.llm_model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-                temperature=0.3
-            )
-            summary = response.choices[0].message.content.strip()
-            if len(summary) > max_len:
-                summary = summary[:max_len] + "…"
-            return summary
-        except Exception as e:
-            print(f"摘要生成失败: {e}")
-            return text[:200] + "…" if text else "No summary"
+    def get_last_papers(self) -> List[dict]:
+        """获取最近一次检索的论文列表"""
+        return self._last_papers
 
-    async def search(self, query: str, num_results: int = 10) -> str:
-        if not self.exa_api_key:
-            return "❌ 语义检索未配置，请设置 EXA_API_KEY"
+    # ---------- Exa Agent 智能检索 ----------
+    async def _exa_agent_search(self, query: str) -> dict:
+        """将用户原始 query 直接传给 Exa Agent，要求以 JSON 格式返回文献列表。"""
+        if not self.exa:
+            return None
 
+        prompt = f"""用户要求：{query}
+
+请根据上述要求检索相关学术文献，并以 JSON 格式返回结果。
+JSON 格式如下（每篇文献尽可能包含 title, authors, year, journal, impact_factor, doi, abstract）：
+{{"papers": [{{"title": "", "authors": "", "year": "", "journal": "", "impact_factor": "", "doi": "", "abstract": ""}}]}}
+"""
         try:
             loop = asyncio.get_running_loop()
-            exa = Exa(self.exa_api_key)
-            result = await loop.run_in_executor(
+            run = await loop.run_in_executor(
                 None,
-                lambda: exa.search(
-                    query,
-                    num_results=num_results,
-                    type="auto",
-                    contents={
-                        "text": {"max_characters": 1000},
-                        "highlights": True
-                    }
-                )
+                lambda: self.exa.agent.runs.create(query=prompt)
             )
-
-            if not result.results:
-                return "未找到相关结果，请尝试其他关键词。"
-
-            # 并发生成摘要
-            tasks = []
-            for item in result.results:
-                title = item.title or "N/A"
-                text = ""
-                if item.highlights and len(item.highlights) > 0:
-                    text = item.highlights[0]
-                elif hasattr(item, 'text') and item.text:
-                    text = item.text
-                tasks.append(self._generate_summary(title, text))
-            summaries = await asyncio.gather(*tasks)
-
-            # 构建表格
-            table = "| 标题 | 作者 | 日期 | 摘要 | URL |\n"
-            table += "|------|------|------|------|-----|\n"
-            for idx, item in enumerate(result.results):
-                # 清洗标题
-                title_raw = item.title or "N/A"
-                title_cleaned = title_raw.replace('\n', ' ').replace('\r', ' ').strip()
-                title_cleaned = re.sub(r'\s+', ' ', title_cleaned)
-                title = title_cleaned.replace("|", "\\|")
-
-                # 清洗作者
-                author = "Unknown"
-                if hasattr(item, 'author') and item.author:
-                    author_raw = str(item.author)
-                    author_cleaned = author_raw.replace('\n', ' ').replace('\r', ' ').strip()
-                    author_cleaned = re.sub(r'\s+', ' ', author_cleaned)
-                    author = author_cleaned.replace("|", "\\|")
-                elif hasattr(item, 'authors') and item.authors:
-                    author_raw = ", ".join(item.authors)[:50]
-                    author_cleaned = author_raw.replace('\n', ' ').replace('\r', ' ').strip()
-                    author_cleaned = re.sub(r'\s+', ' ', author_cleaned)
-                    author = author_cleaned.replace("|", "\\|")
-
-                # 日期
-                date = "Unknown"
-                if hasattr(item, 'published_date') and item.published_date:
-                    date = str(item.published_date)[:10]
-                elif hasattr(item, 'date') and item.date:
-                    date = str(item.date)[:10]
-
-                # 清洗摘要，若为空则赋默认值
-                summary_raw = summaries[idx] if idx < len(summaries) and summaries[idx] else "无摘要"
-                summary_cleaned = summary_raw.replace('\n', ' ').replace('\r', ' ').strip()
-                summary_cleaned = re.sub(r'\s+', ' ', summary_cleaned)
-                summary = summary_cleaned.replace("|", "\\|")
-
-                # URL 清洗
-                url = item.url or ""
-                url_cleaned = url.replace("|", "\\|")
-
-                table += f"| {title} | {author} | {date} | {summary} | [{url_cleaned}]({url_cleaned}) |\n"
-
-            return f"## 🔍 检索结果：{query}\n\n{table}"
-
+            completed_run = await loop.run_in_executor(
+                None,
+                lambda: self.exa.agent.runs.poll_until_finished(run.id)
+            )
+            if completed_run.output and completed_run.output.text:
+                text = completed_run.output.text
+                import json, re
+                json_match = re.search(r'```json\s*([\s\S]*?)\s*```', text)
+                if json_match:
+                    data = json.loads(json_match.group(1))
+                else:
+                    data = json.loads(text)
+                return data
+            return None
         except Exception as e:
-            return f"❌ 检索出错：{str(e)}"
+            print(f"Exa Agent 检索异常: {e}")
+            return None
+
+    # ---------- 格式化结果 ----------
+    def _format_agent_result(self, data: dict, query: str) -> str:
+        """将结构化数据转换为 Markdown 表格"""
+        papers = data.get('papers', [])
+        if not papers:
+            return f"## 🔍 检索结果：{query}\n\n未找到相关结果。"
+
+        headers = ['标题', '作者', '年份', '期刊', '影响因子', 'DOI/链接']
+        keys = ['title', 'authors', 'year', 'journal', 'impact_factor', 'doi']
+
+        table = "| " + " | ".join(headers) + " |\n"
+        table += "|" + "|".join(["------" for _ in headers]) + "|\n"
+
+        for p in papers[:10]:
+            row = []
+            for key in keys:
+                val = p.get(key, '')
+                if val == '' or val is None:
+                    val = '-'
+                else:
+                    val = str(val).replace('\n', ' ').replace('|', '\\|')
+                row.append(val)
+            table += "| " + " | ".join(row) + " |\n"
+
+        abstract_section = "\n**摘要详情**：\n"
+        for idx, p in enumerate(papers[:10], 1):
+            title = p.get('title', '无标题')
+            abstract = p.get('abstract', '无摘要')
+            if len(abstract) > 300:
+                abstract = abstract[:300] + '…'
+            abstract_section += f"{idx}. **{title}**\n   {abstract}\n\n"
+
+        return f"## 🔍 检索结果：{query}\n\n{table}\n{abstract_section}"
+
+    # ---------- 主搜索接口 ----------
+    async def search(self, query: str, use_history: bool = False) -> str:
+        """
+        执行深度检索（Agent），保存结果到 _last_papers，返回格式化的表格。
+        """
+        data = await self._exa_agent_search(query)
+        if data and data.get('papers'):
+            papers = data['papers']
+            self._last_papers = papers
+            result = self._format_agent_result(data, query)
+            if use_history:
+                self.conversation_history.append({"role": "user", "content": query})
+                self.conversation_history.append({"role": "assistant", "content": result})
+            return result
+        else:
+            return f"## 🔍 检索结果：{query}\n\n❌ 检索失败，请稍后重试。"
+
+    # ---------- 基于检索结果的交互式问答 ----------
+    async def ask_with_results(self, question: str, papers: List[dict]) -> str:
+        """
+        基于给定的论文列表回答用户问题（使用 LLM）。
+        """
+        if not papers:
+            return "没有可用的检索结果，请先进行语义检索。"
+
+        # 构建上下文：取前5篇论文的标题和摘要片段
+        context = "以下是最近检索到的学术文献信息：\n\n"
+        for i, p in enumerate(papers[:5], 1):
+            title = p.get('title', '无标题')
+            abstract = p.get('abstract', '无摘要')
+            context += f"{i}. 标题：{title}\n"
+            context += f"   摘要：{abstract[:300]}...\n\n"
+
+        prompt = f"""你是一个科研助手，用户基于上述检索结果提出了一个问题。请根据文献内容回答用户的问题。
+
+{context}
+
+用户问题：{question}
+
+请用中文回答，简洁准确，并注明引用的文献（用编号或标题）。
+"""
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.llm_model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=800
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"❌ 回答生成失败: {e}"
+
+    # ---------- 交互式问答（带历史） ----------
+    async def ask(self, query: str) -> str:
+        """基于历史对话的交互式问答（保留原有功能）"""
+        if self.conversation_history:
+            context = "\n".join([
+                f"{item['role']}: {item['content'][:200]}"
+                for item in self.conversation_history[-6:]
+            ])
+            enhanced_query = f"基于以下对话历史：\n{context}\n\n当前问题：{query}"
+        else:
+            enhanced_query = query
+        result = await self.search(enhanced_query, use_history=True)
+        return result
+
+    def clear_history(self):
+        self.conversation_history = []
+        self._last_papers = []

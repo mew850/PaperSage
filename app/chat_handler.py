@@ -65,12 +65,10 @@ class ChatHandler:
             model=model
         )
         
-        # 存储每个 WebSocket 连接的当前模式（默认专家模式）
-        self.session_modes = {}
-
-        # ---------- 新增：存储每个会话的文献上下文 ----------
-        # session_docs[session_id] = {"text": 全文, "history": [{"role": "user/assistant", "content": ...}]}
+        # 存储每个会话的文献上下文（上传的全文）
         self.session_docs = {}
+        # 存储每个会话的检索结果（用于交互式追问）
+        self.session_search_results = {}
 
         # ---------- 意图识别关键词 ----------
         self.strong_keywords = [
@@ -102,7 +100,7 @@ class ChatHandler:
         # 快速检索关键词（最高优先级）
         self.quick_search_keywords = [
             "检索", "搜索", "查一下", "查找", "search", "find", "look up",
-            "最新新闻", "latest news", "trending", "关于", "about"
+            "最新新闻", "latest news", "trending"
         ]
         # 功能询问关键词
         self.function_keywords = [
@@ -110,11 +108,12 @@ class ChatHandler:
             "what can you do", "functions"
         ]
 
-    # ---------- 新增：提取文献卡片（结构化JSON） ----------
+    # ---------- 提取文献卡片（结构化JSON） ----------
     async def _extract_card(self, text: str, user_query: str = "") -> str:
         """
         调用LLM从文献全文提取核心信息，返回结构化卡片（Markdown格式）。
         """
+        # 截断过长的文本（保留前8000字符）
         if len(text) > 8000:
             text = text[:8000] + "...(截断)"
 
@@ -122,7 +121,7 @@ class ChatHandler:
 
     要求：
     - 只返回一个JSON对象，键为 problem, method, results, limitations。
-    - 每个字段的值为一段详细的中文描述（**每段不超过200字**），要求内容具体、信息丰富，包含关键细节（如具体技术名称、实验参数、主要数据、统计结果、样本量等），避免笼统概括。
+    - 每个字段的值为一段详细、专业的中文描述（**每段不超过200字**），要求内容具体，包含关键细节（如具体技术名称、实验参数、主要数据、统计结果、样本量等），避免笼统概括。
     - 不要包含任何额外文字、注释或Markdown标记。
 
     JSON结构示例：
@@ -143,29 +142,24 @@ class ChatHandler:
                 messages=messages,
                 temperature=0.2,
                 max_tokens=1000,
-                response_format={"type": "json_object"}  # 若模型支持
+                response_format={"type": "json_object"}
             )
             content = response.choices[0].message.content.strip()
             card = json.loads(content)
             for key in ["problem", "method", "results", "limitations"]:
                 if key not in card:
                     card[key] = "信息缺失"
-                # 去除描述中的换行，避免Markdown渲染中断
-                card[key] = card[key].replace('\n', ' ').replace('\r', ' ')
-
-            # ---------- 优化渲染格式：独立段落，更清晰 ----------
             md = f"""## 📄 文献卡片
 
-    **核心问题**：{card['problem']}
+- **核心问题**：{card['problem']}
+- **研究方法**：{card['method']}
+- **关键结果**：{card['results']}
+- **局限性**：{card['limitations']}
 
-    **研究方法**：{card['method']}
 
-    **关键结果**：{card['results']}
 
-    **局限性**：{card['limitations']}
-
-    ---
-    💡 您可以继续提问关于这篇文献的任何细节，我会基于全文为您解答。
+---
+💡 您可以继续提问关于这篇文献的任何细节，我会基于全文为您解答。
     """
             return md
         except json.JSONDecodeError:
@@ -173,9 +167,11 @@ class ChatHandler:
         except Exception as e:
             return f"❌ 卡片生成失败：{str(e)}"
 
+    # ---------- 文献问答（始终使用完整全文） ----------
     async def _literature_chat(self, session_id: int, user_msg: str) -> AsyncGenerator[str, None]:
         """
         基于当前会话的文献上下文进行问答，返回流式响应。
+        始终使用完整全文，不做任何截断。
         """
         context = self.session_docs.get(session_id)
         if not context:
@@ -183,31 +179,22 @@ class ChatHandler:
             return
 
         full_text = context["text"]
-        # 截断用于上下文的文本（保留前6000字符，避免超长）
-        truncated = full_text[:6000] + "..." if len(full_text) > 6000 else full_text
 
         # 构建系统提示
         system_prompt = f"""你是一位科研助手，专门帮助用户理解一篇文献。请根据以下文献内容回答用户的问题。如果用户的问题涉及文献之外的内容，请委婉引导回文献本身。
 
-文献内容（节选）：
-{truncated}
+文献内容（完整全文）：
+{full_text}
 
 注意：回答要准确、简洁，并引用文献中的具体信息。如果无法从文献中找到答案，请如实说明。
 """
-        # 构建消息历史（包含之前的对话）
         history = context.get("history", [])
         messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_msg}]
 
-        # 调用chat_agent流式生成
         async for chunk in self.chat_agent.chat_stream(messages):
             yield chunk
 
-        # 将本次问答追加到历史（注意：只存user和assistant，system不存）
         history.append({"role": "user", "content": user_msg})
-        # 由于流式生成无法直接获取完整响应，我们将在调用方完成响应收集后追加assistant内容
-        # 但为了简单，我们可以在生成后从流中收集完整响应并追加，但这里无法做到。
-        # 方案：在调用方收集完整响应后调用一个方法追加。
-        # 我们将在 handle_websocket 中处理。
 
     # ---------- 已有方法：意图判断、问候等 ----------
     def _is_search_intent(self, text: str):
@@ -257,23 +244,23 @@ class ChatHandler:
         
         prompt = f"""请根据以下文献内容，写一份详实、结构清晰的文献综述（按以下五个部分），总字数控制在 800-1000 字，每个部分至少包含 3-5 个要点，适当展开论述。
 
-        用户查询：{user_query}
+用户查询：{user_query}
 
-        内容：
-        {text}
+内容：
+{text}
 
-        综述结构要求：
-        ## 1. 研究背景与意义
-        ...
-        ## 2. 方法与技术路线
-        ...
-        ## 3. 主要发现与结果
-        ...
-        ## 4. 讨论与综合分析
-        ...
-        ## 5. 结论与展望
-        ...
-        请使用正式、学术的表述，确保逻辑连贯，内容充实。"""
+综述结构要求：
+## 1. 研究背景与意义
+...
+## 2. 方法与技术路线
+...
+## 3. 主要发现与结果
+...
+## 4. 讨论与综合分析
+...
+## 5. 结论与展望
+...
+请使用正式、学术的表述，确保逻辑连贯，内容充实。"""
         
         messages = [{"role": "user", "content": prompt}]
         try:
@@ -281,19 +268,20 @@ class ChatHandler:
                 model=self.chat_agent.model,
                 messages=messages,
                 temperature=0.5,
-                max_tokens=10000
+                max_tokens=2500
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
             return f"总结失败: {e}"
 
-    # ---------- 核心 WebSocket 处理（修改） ----------
+    # ---------- 核心 WebSocket 处理 ----------
     async def handle_websocket(self, websocket: WebSocket):
         await websocket.accept()
         session_id = id(websocket)
-        self.session_modes[session_id] = "expert"  # 默认专家模式
         # 初始化文献上下文（空）
         self.session_docs[session_id] = None
+        # 初始化检索结果（空）
+        self.session_search_results[session_id] = None
 
         try:
             while True:
@@ -301,44 +289,15 @@ class ChatHandler:
                 try:
                     data = json.loads(message)
                     user_msg = data.get("content", "").strip()
-                    if "mode" in data and data["mode"] in ["fast", "expert"]:
-                        self.session_modes[session_id] = data["mode"]
+                    # 如果有模式切换，但已废弃，可忽略
                 except:
                     user_msg = message.strip()
                 if not user_msg:
                     continue
 
-                # ----- 模式切换指令处理 -----
                 lower_msg = user_msg.lower()
-                if "切换到快速模式" in lower_msg or ("快速模式" in lower_msg and "切换" in lower_msg):
-                    self.session_modes[session_id] = "fast"
-                    await websocket.send_text(json.dumps({
-                        "type": "update",
-                        "agent": "System",
-                        "content": "⚡ 已切换到快速模式，将生成简要综述。"
-                    }, default=self.serialize_object))
-                    await websocket.send_text(json.dumps({"type": "end"}, default=self.serialize_object))
-                    continue
-                elif "切换到专家模式" in lower_msg or ("专家模式" in lower_msg and "切换" in lower_msg):
-                    self.session_modes[session_id] = "expert"
-                    await websocket.send_text(json.dumps({
-                        "type": "update",
-                        "agent": "System",
-                        "content": "🧠 已切换到专家模式，将生成详细综述。"
-                    }, default=self.serialize_object))
-                    await websocket.send_text(json.dumps({"type": "end"}, default=self.serialize_object))
-                    continue
-                elif "当前模式" in lower_msg:
-                    mode_name = "快速" if self.session_modes[session_id] == "fast" else "专家"
-                    await websocket.send_text(json.dumps({
-                        "type": "update",
-                        "agent": "System",
-                        "content": f"当前模式：{mode_name}模式"
-                    }, default=self.serialize_object))
-                    await websocket.send_text(json.dumps({"type": "end"}, default=self.serialize_object))
-                    continue
 
-                # ----- 新增：清除文献上下文指令 -----
+                # ----- 清除文献上下文指令 -----
                 if "清除文献" in lower_msg or "退出文献" in lower_msg:
                     self.session_docs[session_id] = None
                     await websocket.send_text(json.dumps({
@@ -349,7 +308,18 @@ class ChatHandler:
                     await websocket.send_text(json.dumps({"type": "end"}, default=self.serialize_object))
                     continue
 
-                # ----- 文献解析指令（改造为交互式卡片） -----
+                # ----- 清除检索结果指令 -----
+                if "清除检索" in lower_msg or "退出检索" in lower_msg:
+                    self.session_search_results[session_id] = None
+                    await websocket.send_text(json.dumps({
+                        "type": "update",
+                        "agent": "System",
+                        "content": "🧹 已清除检索结果，退出检索交互模式。"
+                    }, default=self.serialize_object))
+                    await websocket.send_text(json.dumps({"type": "end"}, default=self.serialize_object))
+                    continue
+
+                # ----- 文献解析指令 -----
                 if user_msg.startswith("解析文件:"):
                     file_id = user_msg[len("解析文件:"):].strip()
                     text = file_cache.get(file_id)
@@ -412,37 +382,60 @@ class ChatHandler:
                     continue
 
                 # ----- 正常处理用户查询 -----
-                current_mode = self.session_modes.get(session_id, "expert")
 
-                # 最高优先级：快速语义检索（不受模式影响）
+                # 1. 最高优先级：语义检索（匹配关键词）
                 if any(kw in user_msg.lower() for kw in self.quick_search_keywords):
-                    table = await self.quick_search_agent.search(user_msg)
+                    # 执行检索
+                    result = await self.quick_search_agent.search(user_msg)
+                    # 获取检索到的论文列表
+                    papers = self.quick_search_agent.get_last_papers()
+                    if papers:
+                        self.session_search_results[session_id] = {
+                            "papers": papers,
+                            "query": user_msg
+                        }
+                    # 发送结果
                     await websocket.send_text(json.dumps({
                         "type": "update",
                         "agent": "QuickSearch",
-                        "content": table
+                        "content": result
                     }, default=self.serialize_object))
                     await websocket.send_text(json.dumps({"type": "end"}, default=self.serialize_object))
                     continue
 
-                # ---------- 新增：文献问答模式（如果存在文献上下文） ----------
+                # 2. 如果存在检索结果，进入检索交互模式
+                if self.session_search_results.get(session_id) is not None:
+                    # 用户正在针对检索结果进行追问
+                    await websocket.send_text(json.dumps({
+                        "type": "update",
+                        "agent": "Thinking",
+                        "content": "💬 正在基于检索结果回答..."
+                    }, default=self.serialize_object))
+                    papers = self.session_search_results[session_id]["papers"]
+                    answer = await self.quick_search_agent.ask_with_results(
+                        user_msg,
+                        papers
+                    )
+                    await websocket.send_text(json.dumps({
+                        "type": "update",
+                        "agent": "ChatAgent",
+                        "content": answer
+                    }, default=self.serialize_object))
+                    await websocket.send_text(json.dumps({"type": "end"}, default=self.serialize_object))
+                    continue
+
+                # 3. 文献问答模式（如果存在文献上下文）
                 if self.session_docs.get(session_id) is not None:
-                    # 用户正在阅读文献，进入问答模式
                     await websocket.send_text(json.dumps({
                         "type": "update",
                         "agent": "Thinking",
                         "content": "📖 正在基于当前文献回答..."
                     }, default=self.serialize_object))
-                    # 收集完整响应
                     full_response = ""
                     async for chunk in self._literature_chat(session_id, user_msg):
                         full_response += chunk
-                        # 流式发送（可选，但为了兼容，我们也可以逐块发送）
-                        # 这里我们一次性发送，也可以改为流式，但为了保持简单，先收集再发送
-                    # 将助手回复追加到历史
                     if self.session_docs[session_id] is not None:
                         self.session_docs[session_id]["history"].append({"role": "assistant", "content": full_response})
-                    # 发送最终回复
                     await websocket.send_text(json.dumps({
                         "type": "update",
                         "agent": "ChatAgent",
@@ -451,87 +444,71 @@ class ChatHandler:
                     await websocket.send_text(json.dumps({"type": "end"}, default=self.serialize_object))
                     continue
 
-                # ----- 原有逻辑：如果无文献上下文，则走原有意图识别 -----
-                # 根据当前模式执行
-                if current_mode == "fast":
-                    # 快速模式（简略综述）
+                # 4. 原有意图识别（综述等）
+                is_search, confidence = self._is_search_intent(user_msg)
+                if 0.3 < confidence < 0.8:
+                    is_search = await self._llm_judge(user_msg)
+                elif confidence <= 0.3:
+                    is_search = False
+
+                if is_search:
                     await websocket.send_text(json.dumps({
                         "type": "update",
                         "agent": "Thinking",
-                        "content": "⚡ 快速模式：正在生成简要综述..."
+                        "content": "🤔 正在思考..."
                     }, default=self.serialize_object))
-                    # 这里可以调用快速总结，暂缺实现，直接提示
-                    await websocket.send_text(json.dumps({
-                        "type": "update",
-                        "agent": "FastSummary",
-                        "content": "快速模式已启用，但当前未实现完整快速综述生成，请切换到专家模式或使用文献解析功能。"
-                    }, default=self.serialize_object))
-                else:
-                    # 专家模式：执行原有的复杂流程
-                    is_search, confidence = self._is_search_intent(user_msg)
-                    if 0.3 < confidence < 0.8:
-                        is_search = await self._llm_judge(user_msg)
-                    elif confidence <= 0.3:
-                        is_search = False
-
-                    if is_search:
+                    async for update in self.search_agent.process_query(user_msg):
                         await websocket.send_text(json.dumps({
                             "type": "update",
-                            "agent": "Thinking",
-                            "content": "🤔 正在思考..."
+                            "agent": update.get("agent"),
+                            "content": update.get("content")
                         }, default=self.serialize_object))
-                        async for update in self.search_agent.process_query(user_msg):
+                else:
+                    # 普通问答
+                    if self._is_greeting(user_msg):
+                        await websocket.send_text(json.dumps({
+                            "type": "update",
+                            "agent": "ChatAgent",
+                            "content": "🤖 正在思考...\n\n"
+                        }, default=self.serialize_object))
+                        reply = "你好！我是你的文献综述助手，可以帮助你检索和总结学术文献(目前仅限开源文献)。有什么需要我帮忙的吗？"
+                        for ch in reply:
                             await websocket.send_text(json.dumps({
                                 "type": "update",
-                                "agent": update.get("agent"),
-                                "content": update.get("content")
+                                "agent": "ChatAgent",
+                                "content": ch
                             }, default=self.serialize_object))
+                            await asyncio.sleep(0.02)
+                    elif any(kw in user_msg.lower() for kw in self.function_keywords):
+                        await websocket.send_text(json.dumps({
+                            "type": "update",
+                            "agent": "ChatAgent",
+                            "content": "🤖 正在思考...\n\n"
+                        }, default=self.serialize_object))
+                        reply = "我的主要功能包括：\n\n1. **语义检索**：基于 Exa 搜索引擎，精确查找相关文献。\n2. **文献解析**：上传文件或输入 URL，自动提取内容并生成综述。\n3. **领域总结**：生成文献综述，梳理研究进展。"
+                        for ch in reply:
+                            await websocket.send_text(json.dumps({
+                                "type": "update",
+                                "agent": "ChatAgent",
+                                "content": ch
+                            }, default=self.serialize_object))
+                            await asyncio.sleep(0.02)
                     else:
-                        # 普通问答
-                        if self._is_greeting(user_msg):
+                        messages = [
+                            {"role": "system", "content": "你是一个文献综述助手，专门帮助用户查找和总结学术文献。你的名字是 PAPERSAGE 助手。请不要介绍自己为 DeepSeek 或其他公司。当用户问候时，友好地介绍自己的功能。"},
+                            {"role": "user", "content": user_msg}
+                        ]
+                        await websocket.send_text(json.dumps({
+                            "type": "update",
+                            "agent": "ChatAgent",
+                            "content": "🤖 正在思考...\n\n"
+                        }, default=self.serialize_object))
+                        async for chunk in self.chat_agent.chat_stream(messages):
                             await websocket.send_text(json.dumps({
                                 "type": "update",
                                 "agent": "ChatAgent",
-                                "content": "🤖 正在思考...\n\n"
+                                "content": chunk
                             }, default=self.serialize_object))
-                            reply = "你好！我是你的文献综述助手，可以帮助你检索和总结学术文献(目前仅限开源文献)。有什么需要我帮忙的吗？"
-                            for ch in reply:
-                                await websocket.send_text(json.dumps({
-                                    "type": "update",
-                                    "agent": "ChatAgent",
-                                    "content": ch
-                                }, default=self.serialize_object))
-                                await asyncio.sleep(0.02)
-                        elif any(kw in user_msg.lower() for kw in self.function_keywords):
-                            await websocket.send_text(json.dumps({
-                                "type": "update",
-                                "agent": "ChatAgent",
-                                "content": "🤖 正在思考...\n\n"
-                            }, default=self.serialize_object))
-                            reply = "我的主要功能包括：\n\n1. **语义检索**：基于 Exa 搜索引擎，精确查找相关文献。\n2. **文献解析**：上传文件或输入 URL，自动提取内容并生成综述。\n3. **领域总结**：生成文献综述，梳理研究进展。"
-                            for ch in reply:
-                                await websocket.send_text(json.dumps({
-                                    "type": "update",
-                                    "agent": "ChatAgent",
-                                    "content": ch
-                                }, default=self.serialize_object))
-                                await asyncio.sleep(0.02)
-                        else:
-                            messages = [
-                                {"role": "system", "content": "你是一个文献综述助手，专门帮助用户查找和总结学术文献。你的名字是 LITERAS 助手。请不要介绍自己为 DeepSeek 或其他公司。当用户问候时，友好地介绍自己的功能。"},
-                                {"role": "user", "content": user_msg}
-                            ]
-                            await websocket.send_text(json.dumps({
-                                "type": "update",
-                                "agent": "ChatAgent",
-                                "content": "🤖 正在思考...\n\n"
-                            }, default=self.serialize_object))
-                            async for chunk in self.chat_agent.chat_stream(messages):
-                                await websocket.send_text(json.dumps({
-                                    "type": "update",
-                                    "agent": "ChatAgent",
-                                    "content": chunk
-                                }, default=self.serialize_object))
 
                 # 结束标记
                 await websocket.send_text(json.dumps({"type": "end"}, default=self.serialize_object))
@@ -539,10 +516,10 @@ class ChatHandler:
             await websocket.send_text(json.dumps({"type": "error", "message": str(e)}, default=self.serialize_object))
         finally:
             # 清理会话资源
-            if session_id in self.session_modes:
-                del self.session_modes[session_id]
             if session_id in self.session_docs:
                 del self.session_docs[session_id]
+            if session_id in self.session_search_results:
+                del self.session_search_results[session_id]
 
     def serialize_object(self, obj):
         if hasattr(obj, "__class__") and obj.__class__.__name__ == "FunctionCall":

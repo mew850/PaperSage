@@ -49,7 +49,6 @@
             background-color: #1e1e1e;
         }
 
-        /* ---------- 卡片表格样式 ---------- */
         .agent-message.result table {
             border-collapse: collapse;
             width: 100%;
@@ -74,12 +73,10 @@
             color: #bb86fc;
         }
 
-        /* ---------- 基础消息样式 ---------- */
         .agent-message {
             padding: 15px;
             border-radius: 12px;
             word-wrap: break-word;
-            /* 移除基类宽度限制，由子类决定 */
             max-width: 100%;
             animation: fadeIn 0.3s ease-in-out;
         }
@@ -87,25 +84,23 @@
         .agent-message.system {
             background-color: #2e2e2e;
             color: #e0e0e0;
-            max-width: 80%; /* system 消息保持窄一些 */
+            max-width: 80%;
         }
 
-        /* ---------- 核心修复：结果卡片 ---------- */
         .agent-message.result {
             background-color: #3a3f5a;
             color: #ffffff;
             align-self: flex-start;
-            max-width: 95%;              /* 占父容器 95% */
-            word-break: break-all;       /* 强制断词（对长URL有效） */
+            max-width: 95%;
+            word-break: break-all;
             overflow-wrap: break-word;
             white-space: normal;
             display: block;
             padding: 15px;
-            /* 保证所有内部元素不溢出 */
         }
         .agent-message.result * {
             max-width: 100%;
-            word-break: break-word;      /* 内部元素继承断词 */
+            word-break: break-word;
             overflow-wrap: break-word;
         }
 
@@ -125,7 +120,6 @@
             max-width: 80%;
         }
 
-        /* 呼吸加载动画 */
         .status-loading {
             animation: pulse 1.5s ease-in-out infinite;
         }
@@ -135,7 +129,6 @@
             100% { opacity: 0.6; }
         }
 
-        /* 工具栏样式 */
         #toolbar {
             display: flex;
             padding: 10px 20px;
@@ -242,12 +235,12 @@
     </div>
 
     <script>
-        // markdown-it 配置（增强兼容性）
+        // markdown-it 配置
         const md = window.markdownit({
-            breaks: true,      // 换行转 <br>
-            linkify: true,     // 自动链接 URL
-            html: true,        // 允许 HTML（安全）
-            typographer: true  // 智能引号等
+            breaks: true,
+            linkify: true,
+            html: true,
+            typographer: true
         });
 
         const wsUrl = window.location.origin.replace(/^http/, 'ws') + '/ws';
@@ -289,7 +282,6 @@
 
                 if (agent === 'user') return;
 
-                // 显示逻辑
                 if (agent === 'FormatterAgent') {
                     const resultDiv = document.createElement('div');
                     resultDiv.className = 'agent-message result';
@@ -346,7 +338,6 @@
                         if (agent === 'System') {
                             resultDiv.textContent = content;
                         } else {
-                            // FastSummary 渲染 Markdown
                             resultDiv.innerHTML = md.render(content);
                         }
                         messagesContainer.appendChild(resultDiv);
@@ -359,7 +350,6 @@
                     currentChatDiv = null;
                     currentChatResponseDiv = null;
                 } else {
-                    // 其他 agent（fallback）
                     const msgDiv = document.createElement('div');
                     const isMarkdown = content.trim().startsWith('#') || 
                                        content.includes('##') || 
@@ -383,7 +373,6 @@
                     currentChatResponseDiv = null;
                 }
             } else if (response.type === 'end') {
-                // ChatAgent 最终渲染
                 if (currentChatResponseDiv) {
                     const rawText = currentChatResponseDiv.textContent;
                     currentChatResponseDiv.innerHTML = md.render(rawText);
